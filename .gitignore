@@ -1,2 +1,4 @@
 /target
-./received_messages.log
+received_messages.log
+frpc.exe
+/frp_config

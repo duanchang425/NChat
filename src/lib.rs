@@ -3,10 +3,14 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::Duration;
 use chrono::Local;
+
+// 添加 frp 模块
+pub mod frp;
+use frp::{FrpManager, FrpConfig, default_frp_config};
 
 const MASTER_VERSION: &str = "0.1.0";
 const BUILD_VERSION: &str = "win0";
@@ -18,6 +22,7 @@ pub struct UdpMessageHandler {
     running: Arc<AtomicBool>,
     output_file: PathBuf,
     receive_port: Option<u16>,
+    frp_manager: Option<FrpManager>, // 添加 frp 管理器
 }
 
 impl UdpMessageHandler {
@@ -45,6 +50,7 @@ impl UdpMessageHandler {
             running: Arc::new(AtomicBool::new(false)),
             output_file: output_path,
             receive_port: None,
+            frp_manager: None,
         })
     }
     
@@ -222,6 +228,86 @@ impl UdpMessageHandler {
     pub fn output_file(&self) -> &PathBuf {
         &self.output_file
     }
+    
+    // ========== Frp 相关方法 ==========
+    
+    /// 初始化 frp 管理器
+    pub fn init_frp(&mut self, config: Option<FrpConfig>) -> anyhow::Result<()> {
+        let config = config.unwrap_or_else(default_frp_config);
+        let mut frp_manager = FrpManager::new(config)?;
+        
+        // 设置本地端口为当前接收端口
+        if let Some(port) = self.receive_port {
+            // 这里需要修改 frp 配置的本地端口
+            // 由于 FrpConfig 是值类型，我们需要重新创建
+            let mut new_config = frp_manager.get_status().config;
+            new_config.local_port = port;
+            frp_manager = FrpManager::new(new_config)?;
+        }
+        
+        self.frp_manager = Some(frp_manager);
+        println!("Frp 管理器已初始化");
+        Ok(())
+    }
+    
+    /// 启动 frp 内网穿透
+    pub fn start_frp(&mut self) -> anyhow::Result<()> {
+        if let Some(ref mut frp_manager) = self.frp_manager {
+            frp_manager.start()?;
+            println!("Frp 内网穿透已启动");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("请先初始化 frp 管理器"))
+        }
+    }
+    
+    /// 停止 frp 内网穿透
+    pub fn stop_frp(&mut self) -> anyhow::Result<()> {
+        if let Some(ref mut frp_manager) = self.frp_manager {
+            frp_manager.stop()?;
+            println!("Frp 内网穿透已停止");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Frp 管理器未初始化"))
+        }
+    }
+    
+    /// 检查 frp 是否正在运行
+    pub fn is_frp_running(&self) -> bool {
+        self.frp_manager.as_ref().map(|m| m.is_running()).unwrap_or(false)
+    }
+    
+    /// 获取 frp 状态
+    pub fn get_frp_status(&self) -> Option<frp::FrpStatus> {
+        self.frp_manager.as_ref().map(|m| m.get_status())
+    }
+    
+    /// 下载 frp 客户端
+    pub async fn download_frp(&mut self) -> anyhow::Result<()> {
+        if let Some(ref mut frp_manager) = self.frp_manager {
+            frp_manager.download_frp_if_needed().await?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("请先初始化 frp 管理器"))
+        }
+    }
+    
+    /// 配置 frp 服务器
+    pub fn configure_frp(&mut self, server_addr: &str, server_port: u16, token: Option<&str>) -> anyhow::Result<()> {
+        let config = FrpConfig {
+            server_addr: server_addr.to_string(),
+            server_port,
+            token: token.map(|t| t.to_string()),
+            local_port: self.receive_port.unwrap_or(8080),
+            remote_port: None,
+            protocol: "tcp".to_string(),
+            name: "nchat".to_string(),
+        };
+        
+        self.frp_manager = Some(FrpManager::new(config)?);
+        println!("Frp 配置已更新");
+        Ok(())
+    }
 }
 
 impl Drop for UdpMessageHandler {
@@ -240,12 +326,18 @@ impl InputHandler {
         command: &str, 
         handler: &mut UdpMessageHandler,
     ) -> bool {
-        match command {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        let cmd = parts.get(0).unwrap_or(&"");
+        
+        match *cmd {
             "send" => self.handle_send(handler),
             "start" => self.handle_start(handler),
             "stop" => self.handle_stop(handler),
             "status" => self.handle_status(handler),
             "version" => self.handle_version(),
+            "frp" => {
+                self.handle_frp(handler, &parts[1..]);
+            }
             "quit" => {
                 println!("程序退出");
                 return true;
@@ -312,6 +404,7 @@ impl InputHandler {
     
     /// 处理状态命令
     fn handle_status(&self, handler: &UdpMessageHandler) {
+        println!("=== NChat 状态 ===");
         match handler.local_send_port() {
             Ok(port) => println!("发送端口: {}", port),
             Err(e) => eprintln!("获取发送端口失败: {}", e),
@@ -325,10 +418,116 @@ impl InputHandler {
         }
         
         println!("消息保存路径: {}", handler.output_file().display());
+        
+        // 显示 frp 状态
+        println!("\n=== Frp 内网穿透状态 ===");
+        println!("运行状态: {}", if handler.is_frp_running() { "运行中" } else { "已停止" });
+        
+        if let Some(status) = handler.get_frp_status() {
+            println!("服务器地址: {}:{}", status.config.server_addr, status.config.server_port);
+            println!("本地端口: {}", status.config.local_port);
+            println!("协议: {}", status.config.protocol);
+            println!("代理名称: {}", status.config.name);
+        } else {
+            println!("Frp 未初始化");
+        }
     }
 
     fn handle_version(&self) {
         println!("NChat version {} {}",MASTER_VERSION,BUILD_VERSION);
+    }
+    
+    /// 处理 frp 相关命令
+    fn handle_frp(&self, handler: &mut UdpMessageHandler, args: &[&str]) {
+        if args.is_empty() {
+            self.show_frp_help();
+            return;
+        }
+        
+        match args[0] {
+            "init" => {
+                if let Err(e) = handler.init_frp(None) {
+                    eprintln!("初始化 frp 失败: {}", e);
+                }
+            }
+            "start" => {
+                if let Err(e) = handler.start_frp() {
+                    eprintln!("启动 frp 失败: {}", e);
+                }
+            }
+            "stop" => {
+                if let Err(e) = handler.stop_frp() {
+                    eprintln!("停止 frp 失败: {}", e);
+                }
+            }
+            "status" => {
+                self.handle_frp_status(handler);
+            }
+            "config" => {
+                if args.len() < 3 {
+                    println!("用法: frp config <服务器地址> <端口> [token]");
+                    return;
+                }
+                let server_addr = args[1];
+                let server_port = match args[2].parse::<u16>() {
+                    Ok(port) => port,
+                    Err(_) => {
+                        eprintln!("无效的端口号: {}", args[2]);
+                        return;
+                    }
+                };
+                let token = args.get(3).copied();
+                
+                if let Err(e) = handler.configure_frp(server_addr, server_port, token) {
+                    eprintln!("配置 frp 失败: {}", e);
+                }
+            }
+            "download" => {
+                println!("正在下载 frp 客户端...");
+                // 由于 download_frp 是异步方法，我们需要在运行时处理
+                // 这里简化处理，提示用户手动下载
+                println!("请手动下载 frp 客户端并放置在当前目录");
+                println!("下载地址: https://github.com/fatedier/frp/releases");
+            }
+            _ => {
+                println!("未知的 frp 命令: {}", args[0]);
+                self.show_frp_help();
+            }
+        }
+    }
+    
+    /// 显示 frp 状态
+    fn handle_frp_status(&self, handler: &UdpMessageHandler) {
+        println!("=== Frp 状态 ===");
+        println!("运行状态: {}", if handler.is_frp_running() { "运行中" } else { "已停止" });
+        
+        if let Some(status) = handler.get_frp_status() {
+            println!("服务器地址: {}:{}", status.config.server_addr, status.config.server_port);
+            println!("本地端口: {}", status.config.local_port);
+            println!("协议: {}", status.config.protocol);
+            println!("代理名称: {}", status.config.name);
+            if let Some(ref token) = status.config.token {
+                println!("认证令牌: {}", token);
+            }
+            println!("配置文件: {}", status.config_path.display());
+        } else {
+            println!("Frp 未初始化");
+        }
+    }
+    
+    /// 显示 frp 帮助信息
+    fn show_frp_help(&self) {
+        println!("\n=== Frp 内网穿透命令 ===");
+        println!("  frp init     - 初始化 frp 管理器");
+        println!("  frp config   - 配置 frp 服务器 (用法: frp config <服务器地址> <端口> [token])");
+        println!("  frp start    - 启动 frp 内网穿透");
+        println!("  frp stop     - 停止 frp 内网穿透");
+        println!("  frp status   - 显示 frp 状态");
+        println!("  frp download - 下载 frp 客户端");
+        println!("\n示例:");
+        println!("  frp config frp.example.com 7000 mytoken");
+        println!("  frp init");
+        println!("  frp start");
     }
 
     /// 显示帮助信息
@@ -339,6 +538,7 @@ impl InputHandler {
         println!("  stop   - 停止消息接收器");
         println!("  status - 显示当前状态");
         println!("  version - 显示当前版本");
+        println!("  frp    - Frp 内网穿透管理 (输入 'frp' 查看详细帮助)");
         println!("  quit   - 退出程序");
         println!("  help   - 显示此帮助信息");
         println!("本软件遵守GPL v3协议.详见https://github.com/duanchang425/YChat")

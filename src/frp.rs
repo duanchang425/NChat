@@ -84,51 +84,90 @@ impl FrpManager {
         if self.is_running() {
             return Err(anyhow::anyhow!("Frp 客户端已在运行"));
         }
-        
+    
         // 生成配置文件
-        //self.generate_config()?;
-        
+        self.generate_config()?;
+    
         // 确定 frp 客户端路径
         let frp_path = if let Some(ref path) = self.frp_path {
             path.clone()
         } else {
-            // 尝试在系统路径中查找 frpc
+            // 获取当前工作目录
+            let current_dir = std::env::current_dir()
+                .context("获取当前工作目录失败")?;
+            
             let frpc_path = if cfg!(windows) {
-                PathBuf::from("frpc.exe")
+                current_dir.join("frpc.exe")
             } else {
-                PathBuf::from("frpc")
+                current_dir.join("frpc")
             };
             
-            // 检查当前目录和系统路径
             if frpc_path.exists() {
                 frpc_path
             } else {
                 return Err(anyhow::anyhow!(
-                    "未找到 frp 客户端。请下载 frp 并将 frpc 放在当前目录，或使用 set_frp_path 设置路径"
+                    "未找到 frp 客户端: {}\n请下载 frp 并将 frpc 放在当前目录，或使用 set_frp_path 设置路径",
+                    frpc_path.display()
                 ));
             }
         };
-        
-        // 启动 frp 客户端进程
+    
+        // 打印调试信息
+        println!("正在启动 frp 客户端...");
+        println!("可执行文件路径: {}", frp_path.display());
+        println!("配置文件路径: {}", self.config_path.display());
+    
+        // 检查文件是否存在
+        if !frp_path.exists() {
+            return Err(anyhow::anyhow!("frp 可执行文件不存在: {}", frp_path.display()));
+        }
+        if !self.config_path.exists() {
+            return Err(anyhow::anyhow!("配置文件不存在: {}", self.config_path.display()));
+        }
+    
+        // 构造命令
         let mut command = Command::new(&frp_path);
         command.arg("-c");
         command.arg(&self.config_path);
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        
-        let child = command.spawn()
-            .context("启动 frp 客户端失败")?;
-        
+    
+        // 只在非 Windows 下重定向输出
+        #[cfg(not(windows))]
+        {
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+        }
+    
+        // 启动进程
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                println!("调试信息: 尝试启动命令: {:?}", command);
+                println!("系统错误: {:?}", e);
+                println!("错误类型: {:?}", e.kind());
+                if let Some(code) = e.raw_os_error() {
+                    println!("系统错误码: {}", code);
+                }
+                return Err(anyhow::anyhow!(
+                    "启动 frp 客户端失败: {}\n请检查：\n1. 文件 {} 是否存在且可执行\n2. 配置文件 {} 是否存在且格式正确\n3. 是否有足够的权限运行程序",
+                    e,
+                    frp_path.display(),
+                    self.config_path.display()
+                ));
+            }
+        };
+    
         println!("Frp 客户端已启动 (PID: {})", child.id());
-        println!("本地端口 {} 将通过 frp 服务器 {}:{} 暴露", 
-                self.config.local_port, self.config.server_addr, self.config.server_port);
-        
+        println!(
+            "本地端口 {} 将通过 frp 服务器 {}:{} 暴露",
+            self.config.local_port, self.config.server_addr, self.config.server_port
+        );
+    
         // 保存进程句柄
         {
             let mut process_guard = self.process.lock().unwrap();
             *process_guard = Some(child);
         }
-        
+    
         Ok(())
     }
     

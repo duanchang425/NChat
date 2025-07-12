@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::Duration;
 use chrono::Local;
+use std::sync::mpsc::{Sender, Receiver, channel};
 
 // 添加 frp 模块
 pub mod frp;
@@ -23,6 +24,7 @@ pub struct UdpMessageHandler {
     output_file: PathBuf,
     receive_port: Option<u16>,
     frp_manager: Option<FrpManager>, // 添加 frp 管理器
+    status_sender: Option<Sender<String>>, // 新增
 }
 
 impl UdpMessageHandler {
@@ -51,11 +53,12 @@ impl UdpMessageHandler {
             output_file: output_path,
             receive_port: None,
             frp_manager: None,
+            status_sender: None, // 新增
         })
     }
     
     /// 启动消息接收器
-    pub fn start_receiver(&mut self, port: u16) -> io::Result<()> {
+    pub fn start_receiver(&mut self, port: u16, status_sender: Sender<String>) -> io::Result<()> {
         if self.is_receiving() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -70,6 +73,7 @@ impl UdpMessageHandler {
         // 设置运行标志
         self.running.store(true, Ordering::SeqCst);
         self.receive_port = Some(port);
+        self.status_sender = Some(status_sender.clone());
         
         // 克隆共享状态
         let running = self.running.clone();
@@ -88,22 +92,20 @@ impl UdpMessageHandler {
             let mut file_writer = match file {
                 Ok(f) => Some(BufWriter::new(f)),
                 Err(e) => {
-                    eprintln!("无法打开文件 {}: {}", output_file.display(), e);
+                    let _ = status_sender.send(format!("无法打开文件 {}: {}", output_file.display(), e));
                     None
                 }
             };
             
-            println!("接收器已启动，监听端口 {}", port);
+            // 启动信息通过通道发送
+            let _ = status_sender.send(format!("接收器已启动，监听端口 {}", port));
             
             while running.load(Ordering::SeqCst) {
                 match receiver_socket.recv_from(&mut buf) {
                     Ok((size, source)) => {
                         let message = match String::from_utf8(buf[..size].to_vec()) {
                             Ok(m) => m,
-                            Err(e) => {
-                                // 保存原始字节数据
-                                format!("<BINARY DATA: {} bytes>", size)
-                            }
+                            Err(_) => format!("<BINARY DATA: {} bytes>", size)
                         };
                         
                         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -112,13 +114,10 @@ impl UdpMessageHandler {
                             timestamp, source, message
                         );
                         
-                        // 打印到控制台
-                        println!("[UDP RECV] {}", log_entry.trim());
-                        
-                        // 写入文件
+                        // 只写入文件，不输出到控制台
                         if let Some(writer) = &mut file_writer {
                             if let Err(e) = writer.write_all(log_entry.as_bytes()) {
-                                eprintln!("文件写入错误: {}", e);
+                                let _ = status_sender.send(format!("文件写入错误: {}", e));
                             }
                         }
                     }
@@ -138,7 +137,7 @@ impl UdpMessageHandler {
                         
                     
                     Err(e) => {
-                        eprintln!("接收错误: {}", e);
+                        let _ = status_sender.send(format!("接收错误: {}", e));
                     }
                 }
             }
@@ -148,7 +147,8 @@ impl UdpMessageHandler {
                 let _ = writer.flush();
             }
             
-            println!("接收器已停止");
+            // 停止信息通过通道发送
+            let _ = status_sender.send("接收器已停止".to_string());
         });
         
         self.receiver_thread = Some(handle);
@@ -384,8 +384,16 @@ impl InputHandler {
         
         match port.parse::<u16>() {
             Ok(port_num) => {
-                if let Err(e) = handler.start_receiver(port_num) {
+                let (status_tx, status_rx) = channel::<String>();
+                if let Err(e) = handler.start_receiver(port_num, status_tx) {
                     eprintln!("启动接收器失败: {}", e);
+                } else {
+                    // 启动一个线程来监听状态通道
+                    thread::spawn(move || {
+                        while let Ok(msg) = status_rx.try_recv() {
+                            println!("{}", msg);
+                        }
+                    });
                 }
             }
             Err(_) => eprintln!("无效的端口号"),

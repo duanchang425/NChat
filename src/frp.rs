@@ -125,17 +125,23 @@ impl FrpManager {
             return Err(anyhow::anyhow!("配置文件不存在: {}", self.config_path.display()));
         }
     
-        // 构造命令
+                // 构造命令
         let mut command = Command::new(&frp_path);
         command.arg("-c");
         command.arg(&self.config_path);
-    
-        // 只在非 Windows 下重定向输出
-        #[cfg(not(windows))]
-        {
-            command.stdout(Stdio::piped());
-            command.stderr(Stdio::piped());
-        }
+
+        // 重定向输出到文件，避免干扰主程序交互
+        let log_file = std::env::current_dir()
+            .context("获取当前工作目录失败")?
+            .join("frpc.log");
+        
+        let stdout_file = File::create(&log_file)
+            .context("创建 frpc 日志文件失败")?;
+        let stderr_file = File::create(&log_file)
+            .context("创建 frpc 日志文件失败")?;
+        
+        command.stdout(Stdio::from(stdout_file));
+        command.stderr(Stdio::from(stderr_file));
     
         // 启动进程
         let child = match command.spawn() {

@@ -1,4 +1,5 @@
 /target
-received_messages.log
 frpc.exe
 /frp_config
+frpc.log
+received_messages.log

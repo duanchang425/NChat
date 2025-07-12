@@ -13,7 +13,7 @@ use std::sync::mpsc::{Sender, Receiver, channel};
 pub mod frp;
 use frp::{FrpManager, FrpConfig, default_frp_config};
 
-const MASTER_VERSION: &str = "1.0.0";
+const MASTER_VERSION: &str = "1.0.1";
 const BUILD_VERSION: &str = "win0";
 
 /// UDP 消息处理器
